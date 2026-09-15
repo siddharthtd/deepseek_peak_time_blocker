@@ -13,8 +13,8 @@ owner can arm.
 ## Install
 
 ```sh
-git clone <this-repo> ~/dev/deepseek-window
-cd ~/dev/deepseek-window
+git clone https://github.com/siddharthtd/deepseek_peak_time_blocker.git ~/dev/deepseek_peak_time_blocker
+cd ~/dev/deepseek_peak_time_blocker
 ./install.sh
 ```
 
