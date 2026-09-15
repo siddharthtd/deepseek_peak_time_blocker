@@ -1,0 +1,14 @@
+[Unit]
+Description=DeepSeek off-peak guard watcher
+Documentation=https://code.visualstudio.com/docs/agent-customization/hooks
+
+[Service]
+Type=simple
+ExecStart=/bin/bash @GUARD@ watch @WORKDIR@
+Restart=always
+RestartSec=5
+StandardOutput=append:@LOG@
+StandardError=append:@LOG@
+
+[Install]
+WantedBy=default.target
