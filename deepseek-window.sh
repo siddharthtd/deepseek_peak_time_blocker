@@ -2,8 +2,12 @@
 # DeepSeek off-peak guard — installed once at user level, so every VS Code
 # workspace obeys the same window.
 #
-# Off-peak (work allowed) UTC: 04:00-06:00 and 10:00-01:00 (crosses midnight).
-# Peak     (work stopped) UTC: 01:00-04:00 and 06:00-10:00. Default is no.
+# Off-peak (work allowed): 04:00-06:00 and 10:00-01:00 (crosses midnight).
+# Peak     (work stopped): 01:00-04:00 and 06:00-10:00. Default is no.
+#
+# Those are clock times on this machine's own clock, not UTC, so the rule reads
+# the same wherever it is installed. AI_WINDOW_TZ=UTC (or any IANA zone) pins the
+# windows to another clock, and every message prints the UTC equivalent.
 #
 #   deepseek-window.sh                guard: exit 0 allowed, exit 1 denied
 #   deepseek-window.sh --hook         VS Code agent hook: JSON on stdout
@@ -20,7 +24,7 @@
 # The owner is the only one who can arm the override — it needs a real terminal
 # and a typed phrase, and the hook refuses an agent's attempt to run it.
 #
-# Verify without waiting for the clock: AI_WINDOW_TEST_NOW_UTC=HH:MM <command>
+# Verify without waiting for the clock: AI_WINDOW_TEST_NOW=HH:MM <command>
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -28,35 +32,54 @@ STATE_DIR="${AI_WINDOW_STATE_DIR:-$HOME/.deepseek-window}"
 HANDOFF="$STATE_DIR/handoff"
 OVERRIDE_FILE="$STATE_DIR/override"
 
+# Window boundaries, as minutes of day on the guard's own clock: this machine's
+# timezone, or AI_WINDOW_TZ=UTC / any IANA zone.
+WINDOW_TZ="${AI_WINDOW_TZ:-local}"
 W1_OPEN=240  # 04:00
 W1_CLOSE=360 # 06:00
 W2_OPEN=600  # 10:00
 W2_CLOSE=60  # 01:00 the following day
-ALLOWED_TEXT="04:00-06:00 and 10:00-01:00 UTC"
-PEAK_TEXT="01:00-04:00 and 06:00-10:00 UTC"
 PHRASE="override peak hours"
 MAX_MINUTES=240
 CODE_BIN_OVERRIDE="${AI_WINDOW_CODE_BIN:-}"
 OWNER_ONLY="owner-only: the DeepSeek off-peak override is the owner's call, not an agent's. Ask the owner to run '$SELF override' in their own terminal (it needs an interactive TTY and a typed phrase)."
 
+# Test-only, read on the window's clock so the boundaries do not depend on where
+# the test runs. AI_WINDOW_TEST_NOW_UTC is the older spelling.
+TEST_CLOCK="${AI_WINDOW_TEST_NOW:-${AI_WINDOW_TEST_NOW_UTC:-}}"
 CLOCK_NOTE=""
-if [[ -n "${AI_WINDOW_TEST_NOW_UTC:-}" ]]; then
-  CLOCK_NOTE=" (clock faked with AI_WINDOW_TEST_NOW_UTC, not the real time)"
+if [[ -n "$TEST_CLOCK" ]]; then
+  CLOCK_NOTE=" (clock faked with AI_WINDOW_TEST_NOW=${TEST_CLOCK}, not the real time)"
 fi
 
 # ---------------------------------------------------------------------------
-# clock
+# clock — every window minute below is on this clock
 # ---------------------------------------------------------------------------
 
+# date(1) in the window timezone. `local` means wherever this machine is.
+zone_date() {
+  if [[ "$WINDOW_TZ" == "local" ]]; then
+    date "$@"
+  else
+    TZ="$WINDOW_TZ" date "$@"
+  fi
+}
+
+ZONE="$(zone_date +%Z)"
+ALLOWED_TEXT="04:00-06:00 and 10:00-01:00 ${ZONE}"
+PEAK_TEXT="01:00-04:00 and 06:00-10:00 ${ZONE}"
+
 minute_now() {
-  if [[ -n "${AI_WINDOW_TEST_NOW_UTC:-}" ]]; then
-    if [[ ! "${AI_WINDOW_TEST_NOW_UTC}" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
-      echo "AI_WINDOW_TEST_NOW_UTC must look like HH:MM" >&2
+  if [[ -n "$TEST_CLOCK" ]]; then
+    if [[ ! "$TEST_CLOCK" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+      echo "AI_WINDOW_TEST_NOW must look like HH:MM" >&2
       exit 64
     fi
     echo "$(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))"
   else
-    echo "$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))"
+    local hm
+    hm="$(zone_date +%H:%M)"
+    echo "$(( 10#${hm%%:*} * 60 + 10#${hm##*:} ))"
   fi
 }
 
@@ -92,6 +115,25 @@ human() {
   else
     echo "$(( $1 / 60 ))m"
   fi
+}
+
+# The windows are in $ZONE, so messages also need the UTC clock. Plain
+# arithmetic on minutes of day, which sidesteps the GNU/BSD date-arithmetic trap.
+zone_offset_minutes() { # minutes east of UTC
+  local raw sign=1
+  raw="$(zone_date +%z)"
+  if [[ "${raw:0:1}" == "-" ]]; then sign=-1; fi
+  echo "$(( (10#${raw:1:2} * 60 + 10#${raw:3:2}) * sign ))"
+}
+
+utc_minute_of() { # minute of day in $ZONE -> minute of day UTC
+  echo "$(( ($1 - $(zone_offset_minutes) + 1440) % 1440 ))"
+}
+
+utc_window_text() { # the allowed windows, on the UTC clock
+  printf '%s-%s and %s-%s UTC' \
+    "$(hhmm "$(utc_minute_of "$W1_OPEN")")" "$(hhmm "$(utc_minute_of "$W1_CLOSE")")" \
+    "$(hhmm "$(utc_minute_of "$W2_OPEN")")" "$(hhmm "$(utc_minute_of "$W2_CLOSE")")"
 }
 
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
@@ -192,11 +234,12 @@ json_escape() {
 }
 
 peak_message() {
-  local m secs
+  local m boundary secs
   m="$(minute_now)"
-  secs="$(seconds_left "$m" "$(date -u +%S)")"
-  printf 'Peak hours: the DeepSeek off-peak window is closed (%s are peak; work is allowed %s). Work stops now and resumes at %s UTC, in %s. Owner override: %s override%s.' \
-    "$PEAK_TEXT" "$ALLOWED_TEXT" "$(hhmm "$(next_change "$m")")" "$(human "$secs")" "$SELF" "$CLOCK_NOTE"
+  boundary="$(next_change "$m")"
+  secs="$(seconds_left "$m" "$(zone_date +%S)")"
+  printf 'Peak hours: the DeepSeek off-peak window is closed (%s are peak; work is allowed %s). Work stops now and resumes at %s %s (%s UTC), in %s. Owner override: %s override%s.' \
+    "$PEAK_TEXT" "$ALLOWED_TEXT" "$(hhmm "$boundary")" "$ZONE" "$(hhmm "$(utc_minute_of "$boundary")")" "$(human "$secs")" "$SELF" "$CLOCK_NOTE"
 }
 
 hook_out() {
@@ -315,14 +358,14 @@ watch_mode() {
     if is_open "$m"; then state=open; else state=closed; fi
     if [[ "$state" != "$prev" ]]; then
       if [[ "$state" == "open" ]]; then
-        echo "OFF-PEAK — work resumes now ($(now_iso)). Next peak: $(hhmm "$(next_change "$m")") UTC."
+        echo "OFF-PEAK — work resumes now ($(now_iso)). Next peak: $(hhmm "$(next_change "$m")") $ZONE."
         restart_handoff
       else
-        echo "PEAK HOURS — work stops now ($(now_iso)). Work resumes $(hhmm "$(next_change "$m")") UTC."
+        echo "PEAK HOURS — work stops now ($(now_iso)). Work resumes $(hhmm "$(next_change "$m")") $ZONE."
       fi
       prev="$state"
     fi
-    secs="$(seconds_left "$m" "$(date -u +%S)")"
+    secs="$(seconds_left "$m" "$(zone_date +%S)")"
     if (( secs > 30 )); then secs=30; fi
     if (( secs < 1 )); then secs=1; fi
     sleep "$secs"
@@ -348,7 +391,7 @@ override_arm() {
   fi
   m="$(minute_now)"
   if is_open "$m"; then
-    echo "override: the window is already open ($(hhmm "$m") UTC); nothing to override."
+    echo "override: the window is already open ($(hhmm "$m") $ZONE); nothing to override."
     exit 0
   fi
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -371,7 +414,7 @@ override_arm() {
     printf 'expires_epoch=%s\n' "$(( $(date -u +%s) + minutes * 60 ))"
     printf 'reason=%s\n' "${reason:-not given}"
   } > "$OVERRIDE_FILE"
-  echo "override armed until $(hhmm "$target") UTC (${minutes}m). Every decision says so until then, and it expires by itself."
+  echo "override armed until $(hhmm "$target") $ZONE ($(hhmm "$(utc_minute_of "$target")") UTC), for ${minutes}m. Every decision says so until then, and it expires by itself."
 }
 
 # ---------------------------------------------------------------------------
@@ -382,16 +425,22 @@ status_mode() {
   local m boundary secs state note
   m="$(minute_now)"
   boundary="$(next_change "$m")"
-  secs="$(seconds_left "$m" "$(date -u +%S)")"
+  secs="$(seconds_left "$m" "$(zone_date +%S)")"
   if is_open "$m"; then
-    state="OPEN — work allowed until $(hhmm "$boundary") UTC (in $(human "$secs"))"
+    state="OPEN — work allowed until $(hhmm "$boundary") $ZONE ($(hhmm "$(utc_minute_of "$boundary")") UTC), in $(human "$secs")"
   else
-    state="CLOSED (peak hours) — work resumes $(hhmm "$boundary") UTC (in $(human "$secs"))"
+    state="CLOSED (peak hours) — work resumes $(hhmm "$boundary") $ZONE ($(hhmm "$(utc_minute_of "$boundary")") UTC), in $(human "$secs")"
   fi
   echo "DeepSeek off-peak guard $SELF"
-  echo "now:        $(now_iso) ($(hhmm "$m") UTC)$CLOCK_NOTE"
+  echo "now:        $(now_iso) ($(hhmm "$m") $ZONE)$CLOCK_NOTE"
+  if [[ "$WINDOW_TZ" == "local" ]]; then
+    echo "zone:       $ZONE, this machine's clock (AI_WINDOW_TZ pins another)"
+  else
+    echo "zone:       $ZONE (AI_WINDOW_TZ=$WINDOW_TZ)"
+  fi
   echo "allowed:    $ALLOWED_TEXT"
   echo "peak:       $PEAK_TEXT"
+  echo "utc:        allowed $(utc_window_text)"
   echo "state:      $state"
   note="$(override_note)"
   echo "override:   ${note:-none}"

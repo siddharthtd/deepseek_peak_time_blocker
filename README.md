@@ -4,11 +4,17 @@ Keeps AI work inside the DeepSeek off-peak window — for **every** VS Code
 workspace on the machine, not just one repo — with a manual override only the
 owner can arm.
 
-| | UTC |
+| | clock time |
 | --- | --- |
 | Off-peak — work allowed | **04:00-06:00** and **10:00-01:00** (the second window crosses midnight) |
 | Peak — work stopped | **01:00-04:00** and **06:00-10:00** |
 | Default | **no** — outside an allowed window, nothing runs |
+
+Those are times on **this machine's own clock**, not UTC, so the rule reads the
+same way wherever the guard is installed: at 8 PM you are inside off-peak, at
+2 AM you are not. Every message prints the UTC equivalent of the boundary next to
+the local one, and `AI_WINDOW_TZ=UTC` (or any IANA zone, e.g.
+`America/Los_Angeles`) pins the windows to another clock entirely.
 
 ## Install
 
@@ -85,12 +91,17 @@ want an override that no in-workspace process can even attempt, set
 ~/.copilot/hooks/deepseek-window.sh watch         # the boundary watcher (install.sh sets this up)
 ~/.copilot/hooks/deepseek-window.sh override      # owner-only, interactive
 ~/.copilot/hooks/deepseek-window.sh               # guard mode: exit 0 allowed, exit 1 denied
-AI_WINDOW_TEST_NOW_UTC=02:00 ~/.copilot/hooks/deepseek-window.sh status   # fake the clock
+AI_WINDOW_TEST_NOW=02:00 ~/.copilot/hooks/deepseek-window.sh status   # fake the clock
 ```
 
-Useful environment variables: `AI_WINDOW_OVERRIDE` / `AI_WINDOW_OVERRIDE_REASON`,
+Useful environment variables: `AI_WINDOW_TZ` (which clock the windows are on,
+`local` by default), `AI_WINDOW_OVERRIDE` / `AI_WINDOW_OVERRIDE_REASON`,
 `AI_WINDOW_CODE_BIN` (path to the VS Code CLI), `AI_WINDOW_STATE_DIR`,
-`AI_WINDOW_TEST_NOW_UTC`.
+`AI_WINDOW_TEST_NOW`.
+
+Changing the windows: edit the four `W1_OPEN` / `W1_CLOSE` / `W2_OPEN` /
+`W2_CLOSE` constants at the top of `deepseek-window.sh` (minutes of day on the
+window clock) and re-run `./install.sh`.
 
 ## Uninstall
 
