@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # DeepSeek off-peak guard — installed once at user level, so every VS Code
-# workspace obeys the same window.
+# workspace on this machine obeys the same window.
 #
-# Off-peak (work allowed): 04:00-06:00 and 10:00-01:00 (crosses midnight).
-# Peak     (work stopped): 01:00-04:00 and 06:00-10:00. Default is no.
+# The rule is DeepSeek's own schedule, defined in UTC:
 #
-# Those are clock times on this machine's own clock, not UTC, so the rule reads
-# the same wherever it is installed. AI_WINDOW_TZ=UTC (or any IANA zone) pins the
-# windows to another clock, and every message prints the UTC equivalent.
+#   peak (work stopped)   Mon-Fri 01:00-04:00 and 06:00-10:00 UTC
+#   off-peak (allowed)    everything else, including the whole weekend
+#
+# The decision is made on the UTC clock, and the machine's timezone is used to
+# *show* you when each boundary lands in your own day, next to the UTC value.
 #
 #   deepseek-window.sh                guard: exit 0 allowed, exit 1 denied
 #   deepseek-window.sh --hook         VS Code agent hook: JSON on stdout
@@ -24,7 +25,8 @@
 # The owner is the only one who can arm the override — it needs a real terminal
 # and a typed phrase, and the hook refuses an agent's attempt to run it.
 #
-# Verify without waiting for the clock: AI_WINDOW_TEST_NOW=HH:MM <command>
+# Verify without waiting for the clock (both values are UTC):
+#   AI_WINDOW_TEST_NOW=05:30 AI_WINDOW_TEST_DAY=Mon deepseek-window.sh status
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -32,141 +34,196 @@ STATE_DIR="${AI_WINDOW_STATE_DIR:-$HOME/.deepseek-window}"
 HANDOFF="$STATE_DIR/handoff"
 OVERRIDE_FILE="$STATE_DIR/override"
 
-# Window boundaries, as minutes of day on the guard's own clock: this machine's
-# timezone, or AI_WINDOW_TZ=UTC / any IANA zone.
-WINDOW_TZ="${AI_WINDOW_TZ:-local}"
-W1_OPEN=240  # 04:00
-W1_CLOSE=360 # 06:00
-W2_OPEN=600  # 10:00
-W2_CLOSE=60  # 01:00 the following day
+# Peak windows: minutes of day UTC, plus the UTC days they apply to (1=Mon..5=Fri,
+# 0=Sun, 6=Sat). Change these four numbers and $PEAK_DAYS to change the rule.
+PEAK1_OPEN=60    # 01:00 UTC
+PEAK1_CLOSE=240  # 04:00 UTC
+PEAK2_OPEN=360   # 06:00 UTC
+PEAK2_CLOSE=600  # 10:00 UTC
+PEAK_DAYS="12345"
+
 PHRASE="override peak hours"
 MAX_MINUTES=240
 CODE_BIN_OVERRIDE="${AI_WINDOW_CODE_BIN:-}"
 OWNER_ONLY="owner-only: the DeepSeek off-peak override is the owner's call, not an agent's. Ask the owner to run '$SELF override' in their own terminal (it needs an interactive TTY and a typed phrase)."
 
-# Test-only, read on the window's clock so the boundaries do not depend on where
-# the test runs. AI_WINDOW_TEST_NOW_UTC is the older spelling.
+# Test-only. Both are UTC, so a test says the same thing wherever it runs. They
+# are parsed here, at the top level, so a bad value exits the script instead of a
+# subshell.
 TEST_CLOCK="${AI_WINDOW_TEST_NOW:-${AI_WINDOW_TEST_NOW_UTC:-}}"
-CLOCK_NOTE=""
+TEST_DAY="${AI_WINDOW_TEST_DAY:-}"
+TEST_MINUTE=""
+TEST_DOW=""
 if [[ -n "$TEST_CLOCK" ]]; then
-  CLOCK_NOTE=" (clock faked with AI_WINDOW_TEST_NOW=${TEST_CLOCK}, not the real time)"
+  if [[ ! "$TEST_CLOCK" =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || (( 10#${BASH_REMATCH[1]} > 23 || 10#${BASH_REMATCH[2]} > 59 )); then
+    echo "AI_WINDOW_TEST_NOW must look like HH:MM in UTC" >&2
+    exit 64
+  fi
+  TEST_MINUTE=$(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))
+fi
+if [[ -n "$TEST_DAY" ]]; then
+  case "$(printf '%s' "$TEST_DAY" | tr '[:upper:]' '[:lower:]')" in
+    sun | su | 7) TEST_DOW=0 ;;
+    mon | mo | 1) TEST_DOW=1 ;;
+    tue | tu | 2) TEST_DOW=2 ;;
+    wed | we | 3) TEST_DOW=3 ;;
+    thu | th | 4) TEST_DOW=4 ;;
+    fri | fr | 5) TEST_DOW=5 ;;
+    sat | sa | 6) TEST_DOW=6 ;;
+    *)
+      echo "AI_WINDOW_TEST_DAY must be Mon..Sun, or 1..7 with Mon=1" >&2
+      exit 64
+      ;;
+  esac
+fi
+CLOCK_NOTE=""
+if [[ -n "$TEST_CLOCK" || -n "$TEST_DAY" ]]; then
+  CLOCK_NOTE=" (test clock: AI_WINDOW_TEST_NOW=${TEST_CLOCK:-real} AI_WINDOW_TEST_DAY=${TEST_DAY:-real})"
 fi
 
 # ---------------------------------------------------------------------------
-# clock — every window minute below is on this clock
+# days and clock, all in UTC
 # ---------------------------------------------------------------------------
 
-# date(1) in the window timezone. `local` means wherever this machine is.
-zone_date() {
-  if [[ "$WINDOW_TZ" == "local" ]]; then
-    date "$@"
-  else
-    TZ="$WINDOW_TZ" date "$@"
-  fi
+dow_name() {
+  case "$1" in
+    0) echo Sun ;;
+    1) echo Mon ;;
+    2) echo Tue ;;
+    3) echo Wed ;;
+    4) echo Thu ;;
+    5) echo Fri ;;
+    6) echo Sat ;;
+  esac
 }
 
-ZONE="$(zone_date +%Z)"
-ALLOWED_TEXT="04:00-06:00 and 10:00-01:00 ${ZONE}"
-PEAK_TEXT="01:00-04:00 and 06:00-10:00 ${ZONE}"
+epoch_dow() { echo "$(( ($1 / 86400 + 4) % 7 ))"; } # epoch 0 was a Thursday
+epoch_minute() { echo "$(( ($1 % 86400) / 60 ))"; }
 
-minute_now() {
+# Now, as a UTC epoch. The test clock shifts the day and the minute of day, so
+# countdowns, weekdays, and boundaries stay internally consistent.
+now_epoch() {
+  local real midnight dow shift=0 minute
+  real="$(date -u +%s)"
+  if [[ -z "$TEST_CLOCK" && -z "$TEST_DAY" ]]; then
+    printf '%s' "$real"
+    return 0
+  fi
+  midnight=$(( real - real % 86400 ))
+  dow=$(( (real / 86400 + 4) % 7 ))
+  if [[ -n "$TEST_DAY" ]]; then
+    shift=$(( (TEST_DOW - dow + 7) % 7 ))
+  fi
+  minute=$(( (real % 86400) / 60 ))
   if [[ -n "$TEST_CLOCK" ]]; then
-    if [[ ! "$TEST_CLOCK" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
-      echo "AI_WINDOW_TEST_NOW must look like HH:MM" >&2
-      exit 64
-    fi
-    echo "$(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))"
-  else
-    local hm
-    hm="$(zone_date +%H:%M)"
-    echo "$(( 10#${hm%%:*} * 60 + 10#${hm##*:} ))"
+    minute="$TEST_MINUTE"
   fi
+  printf '%s' "$(( midnight + shift * 86400 + minute * 60 ))"
 }
 
-is_open() {
-  local m="$1"
-  (( m >= W1_OPEN && m < W1_CLOSE )) || (( m >= W2_OPEN || m < W2_CLOSE ))
+is_peak() { # epoch
+  local dow minute
+  dow="$(epoch_dow "$1")"
+  case "$PEAK_DAYS" in *"$dow"*) ;; *) return 1 ;; esac
+  minute="$(epoch_minute "$1")"
+  (( minute >= PEAK1_OPEN && minute < PEAK1_CLOSE )) ||
+    (( minute >= PEAK2_OPEN && minute < PEAK2_CLOSE ))
 }
 
-next_change() {
-  local m="$1"
-  if (( m >= W2_OPEN || m < W2_CLOSE )); then
-    echo "$W2_CLOSE"
-  elif (( m < W1_OPEN )); then
-    echo "$W1_OPEN"
-  elif (( m < W1_CLOSE )); then
-    echo "$W1_CLOSE"
-  else
-    echo "$W2_OPEN"
-  fi
-}
-
-seconds_left() { # minute, second
-  local m="$1" s="$2" boundary
-  boundary="$(next_change "$m")"
-  echo "$(( ((boundary - m + 1440) % 1440) * 60 - s ))"
-}
-
-hhmm() { printf '%02d:%02d' "$(( $1 / 60 % 24 ))" "$(( $1 % 60 ))"; }
-
-human() {
-  if (( $1 >= 3600 )); then
-    echo "$(( $1 / 3600 ))h $(( ($1 % 3600) / 60 ))m"
-  else
-    echo "$(( $1 / 60 ))m"
-  fi
-}
-
-# The windows are in $ZONE, so messages also need the UTC clock. Plain
-# arithmetic on minutes of day, which sidesteps the GNU/BSD date-arithmetic trap.
-zone_offset_minutes() { # minutes east of UTC
-  local raw sign=1
-  raw="$(zone_date +%z)"
-  if [[ "${raw:0:1}" == "-" ]]; then sign=-1; fi
-  echo "$(( (10#${raw:1:2} * 60 + 10#${raw:3:2}) * sign ))"
-}
-
-utc_minute_of() { # minute of day in $ZONE -> minute of day UTC
-  echo "$(( ($1 - $(zone_offset_minutes) + 1440) % 1440 ))"
-}
-
-utc_window_text() { # the allowed windows, on the UTC clock
-  printf '%s-%s and %s-%s UTC' \
-    "$(hhmm "$(utc_minute_of "$W1_OPEN")")" "$(hhmm "$(utc_minute_of "$W1_CLOSE")")" \
-    "$(hhmm "$(utc_minute_of "$W2_OPEN")")" "$(hhmm "$(utc_minute_of "$W2_CLOSE")")"
-}
-
-now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
-
-# The VS Code CLI used to reopen chat when off-peak starts: PATH first, then the
-# usual app-bundle and package locations on macOS and Linux.
-find_code() {
-  local candidate
-  if [[ -n "$CODE_BIN_OVERRIDE" ]]; then
-    printf '%s' "$CODE_BIN_OVERRIDE"
-    return 0
-  fi
-  if command -v code >/dev/null 2>&1; then
-    command -v code
-    return 0
-  fi
-  for candidate in \
-    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
-    "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code" \
-    "$HOME/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
-    "$HOME/.local/bin/code" \
-    /usr/bin/code \
-    /usr/share/code/bin/code \
-    /snap/bin/code; do
-    if [[ -x "$candidate" ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
+# The next instant the state flips: a peak start while we are off-peak, or the
+# end of the window we are in. Weekends fall out of this for free.
+next_change() { # epoch -> epoch
+  local e="$1" base day k cand cur nxt
+  base=$(( e - e % 86400 ))
+  if is_peak "$e"; then cur=1; else cur=0; fi
+  for day in 0 1 2 3 4 5 6 7; do
+    for k in "$PEAK1_OPEN" "$PEAK1_CLOSE" "$PEAK2_OPEN" "$PEAK2_CLOSE"; do
+      cand=$(( base + day * 86400 + k * 60 ))
+      if (( cand > e )); then
+        if is_peak "$cand"; then nxt=1; else nxt=0; fi
+        if (( nxt != cur )); then
+          printf '%s' "$cand"
+          return 0
+        fi
+      fi
+    done
   done
+  printf '%s' "$(( e + 86400 ))" # unreachable with these windows
+}
+
+human() { # seconds
+  local s="$1" d h m
+  if (( s < 0 )); then s=0; fi
+  d=$(( s / 86400 ))
+  h=$(( (s % 86400) / 3600 ))
+  m=$(( (s % 3600) / 60 ))
+  if (( d > 0 )); then
+    echo "${d}d ${h}h"
+  elif (( h > 0 )); then
+    echo "${h}h ${m}m"
+  else
+    echo "${m}m"
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# state
+# showing the boundary in the operator's own day (display only; never the rule)
+# ---------------------------------------------------------------------------
+
+BSD_DATE=0
+if date -r 0 +%s >/dev/null 2>&1; then BSD_DATE=1; fi
+
+utc_hm() { # epoch -> HH:MM UTC
+  if (( BSD_DATE )); then date -u -r "$1" '+%H:%M'; else date -u -d "@$1" '+%H:%M'; fi
+}
+
+utc_full() { # epoch -> "Mon 18:00" UTC
+  if (( BSD_DATE )); then date -u -r "$1" '+%a %H:%M'; else date -u -d "@$1" '+%a %H:%M'; fi
+}
+
+local_hm() { # epoch -> HH:MM local
+  if (( BSD_DATE )); then date -r "$1" '+%H:%M'; else date -d "@$1" '+%H:%M'; fi
+}
+
+local_full() { # epoch -> "Mon 18:00" local
+  if (( BSD_DATE )); then date -r "$1" '+%a %H:%M'; else date -d "@$1" '+%a %H:%M'; fi
+}
+
+zone_name() { date +%Z; }
+
+# "04:00 UTC (21:00 PDT)"
+at_both() { # epoch
+  printf '%s UTC (%s %s)' "$(utc_hm "$1")" "$(local_hm "$1")" "$(zone_name)"
+}
+
+state_line() { # epoch
+  local e="$1" change secs dow
+  change="$(next_change "$e")"
+  secs=$(( change - e ))
+  if is_peak "$e"; then
+    printf 'PEAK — work stopped until %s, in %s' "$(at_both "$change")" "$(human "$secs")"
+    return 0
+  fi
+  dow="$(epoch_dow "$e")"
+  if [[ "$dow" == 0 || "$dow" == 6 ]]; then
+    printf 'OPEN (weekend) — next peak %s UTC (%s %s), in %s' \
+      "$(utc_full "$change")" "$(local_full "$change")" "$(zone_name)" "$(human "$secs")"
+  else
+    printf 'OPEN — work allowed until %s, in %s' "$(at_both "$change")" "$(human "$secs")"
+  fi
+}
+
+peak_message() { # the whole sentence a blocked agent and its owner see
+  local e change secs
+  e="$(now_epoch)"
+  change="$(next_change "$e")"
+  secs=$(( change - e ))
+  printf 'Peak hours: work is stopped. The rule is Mon-Fri 01:00-04:00 and 06:00-10:00 UTC; now it is %s. Work resumes at %s, in %s. Owner override: %s override (interactive, owner-only)%s.' \
+    "$(at_both "$e")" "$(at_both "$change")" "$(human "$secs")" "$SELF" "$CLOCK_NOTE"
+}
+
+# ---------------------------------------------------------------------------
+# state: parked work, owner override
 # ---------------------------------------------------------------------------
 
 kv() { # file, key
@@ -223,7 +280,7 @@ override_note() {
 }
 
 # ---------------------------------------------------------------------------
-# messages
+# what the VS Code hooks get
 # ---------------------------------------------------------------------------
 
 json_escape() {
@@ -233,26 +290,13 @@ json_escape() {
     | awk '{ if (NR > 1) printf "\\n"; printf "%s", $0 }'
 }
 
-peak_message() {
-  local m boundary secs
-  m="$(minute_now)"
-  boundary="$(next_change "$m")"
-  secs="$(seconds_left "$m" "$(zone_date +%S)")"
-  printf 'Peak hours: the DeepSeek off-peak window is closed (%s are peak; work is allowed %s). Work stops now and resumes at %s %s (%s UTC), in %s. Owner override: %s override%s.' \
-    "$PEAK_TEXT" "$ALLOWED_TEXT" "$(hhmm "$boundary")" "$ZONE" "$(hhmm "$(utc_minute_of "$boundary")")" "$(human "$secs")" "$SELF" "$CLOCK_NOTE"
-}
-
 hook_out() {
   printf '%s\n' "$1"
   exit 0
 }
 
-# ---------------------------------------------------------------------------
-# hook mode
-# ---------------------------------------------------------------------------
-
 hook_mode() {
-  local payload="" event tool prompt cwd m handoff text note
+  local payload="" event tool prompt cwd e handoff text note
 
   [[ -t 0 ]] || payload="$(cat || true)"
   json_field() {
@@ -277,9 +321,9 @@ hook_mode() {
       ;;
   esac
 
-  m="$(minute_now)"
+  e="$(now_epoch)"
 
-  if is_open "$m"; then
+  if ! is_peak "$e"; then
     # Work may proceed. Hand back anything the last peak window parked, once.
     handoff=""
     case "$event" in
@@ -324,8 +368,33 @@ hook_mode() {
 }
 
 # ---------------------------------------------------------------------------
-# watch mode: announce the boundaries and restart parked work at off-peak
+# watch: announce the boundaries, restart parked work at off-peak
 # ---------------------------------------------------------------------------
+
+find_code() {
+  local candidate
+  if [[ -n "$CODE_BIN_OVERRIDE" ]]; then
+    printf '%s' "$CODE_BIN_OVERRIDE"
+    return 0
+  fi
+  if command -v code >/dev/null 2>&1; then
+    command -v code
+    return 0
+  fi
+  for candidate in \
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+    "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code" \
+    "$HOME/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+    "$HOME/.local/bin/code" \
+    /usr/bin/code \
+    /usr/share/code/bin/code \
+    /snap/bin/code; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+}
 
 restart_handoff() {
   local text dir code
@@ -350,22 +419,24 @@ restart_handoff() {
 }
 
 watch_mode() {
-  local dir="${1:-$PWD}" m secs state prev=""
+  local dir="${1:-$PWD}" e secs state prev="" change
   cd "$dir" 2>/dev/null || true
-  echo "deepseek-window: watching $PWD — peak ${PEAK_TEXT}, work allowed ${ALLOWED_TEXT}."
+  echo "deepseek-window: watching $PWD — peak Mon-Fri 01:00-04:00 and 06:00-10:00 UTC, off-peak otherwise."
   while :; do
-    m="$(minute_now)"
-    if is_open "$m"; then state=open; else state=closed; fi
+    e="$(now_epoch)"
+    if is_peak "$e"; then state=peak; else state=open; fi
     if [[ "$state" != "$prev" ]]; then
+      change="$(next_change "$e")"
       if [[ "$state" == "open" ]]; then
-        echo "OFF-PEAK — work resumes now ($(now_iso)). Next peak: $(hhmm "$(next_change "$m")") $ZONE."
+        echo "OFF-PEAK — work resumes now ($(at_both "$e")). Next peak: $(at_both "$change")."
         restart_handoff
       else
-        echo "PEAK HOURS — work stops now ($(now_iso)). Work resumes $(hhmm "$(next_change "$m")") $ZONE."
+        echo "PEAK HOURS — work stops now ($(at_both "$e")). Work resumes $(at_both "$change")."
       fi
       prev="$state"
     fi
-    secs="$(seconds_left "$m" "$(zone_date +%S)")"
+    change="$(next_change "$e")"
+    secs=$(( change - e ))
     if (( secs > 30 )); then secs=30; fi
     if (( secs < 1 )); then secs=1; fi
     sleep "$secs"
@@ -377,7 +448,7 @@ watch_mode() {
 # ---------------------------------------------------------------------------
 
 override_arm() {
-  local minutes=30 reason="" answer m target
+  local minutes=30 reason="" answer e target
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --minutes) minutes="${2:-}"; shift 2 ;;
@@ -389,9 +460,9 @@ override_arm() {
     echo "override: --minutes must be 1..$MAX_MINUTES" >&2
     exit 64
   fi
-  m="$(minute_now)"
-  if is_open "$m"; then
-    echo "override: the window is already open ($(hhmm "$m") $ZONE); nothing to override."
+  e="$(now_epoch)"
+  if ! is_peak "$e"; then
+    echo "override: work is already allowed ($(at_both "$e")); nothing to override."
     exit 0
   fi
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -404,17 +475,17 @@ override_arm() {
     echo "refused: the phrase did not match." >&2
     exit 4
   fi
-  target=$(( (m + minutes) % 1440 ))
+  target=$(( e + minutes * 60 ))
   mkdir -p "$STATE_DIR"
   umask 077
   {
-    printf 'armed_at=%s\n' "$(now_iso)"
+    printf 'armed_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'armed_by=%s\n' "${USER:-$(id -un)}@$(tty 2>/dev/null || echo '?')"
     printf 'minutes=%s\n' "$minutes"
-    printf 'expires_epoch=%s\n' "$(( $(date -u +%s) + minutes * 60 ))"
+    printf 'expires_epoch=%s\n' "$target"
     printf 'reason=%s\n' "${reason:-not given}"
   } > "$OVERRIDE_FILE"
-  echo "override armed until $(hhmm "$target") $ZONE ($(hhmm "$(utc_minute_of "$target")") UTC), for ${minutes}m. Every decision says so until then, and it expires by itself."
+  echo "override armed until $(at_both "$target"), for ${minutes}m. Every decision says so until then, and it expires by itself."
 }
 
 # ---------------------------------------------------------------------------
@@ -422,26 +493,12 @@ override_arm() {
 # ---------------------------------------------------------------------------
 
 status_mode() {
-  local m boundary secs state note
-  m="$(minute_now)"
-  boundary="$(next_change "$m")"
-  secs="$(seconds_left "$m" "$(zone_date +%S)")"
-  if is_open "$m"; then
-    state="OPEN — work allowed until $(hhmm "$boundary") $ZONE ($(hhmm "$(utc_minute_of "$boundary")") UTC), in $(human "$secs")"
-  else
-    state="CLOSED (peak hours) — work resumes $(hhmm "$boundary") $ZONE ($(hhmm "$(utc_minute_of "$boundary")") UTC), in $(human "$secs")"
-  fi
+  local e change note
+  e="$(now_epoch)"
   echo "DeepSeek off-peak guard $SELF"
-  echo "now:        $(now_iso) ($(hhmm "$m") $ZONE)$CLOCK_NOTE"
-  if [[ "$WINDOW_TZ" == "local" ]]; then
-    echo "zone:       $ZONE, this machine's clock (AI_WINDOW_TZ pins another)"
-  else
-    echo "zone:       $ZONE (AI_WINDOW_TZ=$WINDOW_TZ)"
-  fi
-  echo "allowed:    $ALLOWED_TEXT"
-  echo "peak:       $PEAK_TEXT"
-  echo "utc:        allowed $(utc_window_text)"
-  echo "state:      $state"
+  echo "now:        $(at_both "$e") $(dow_name "$(epoch_dow "$e")")$CLOCK_NOTE"
+  echo "rule:       peak Mon-Fri 01:00-04:00 and 06:00-10:00 UTC; everything else off-peak"
+  echo "state:      $(state_line "$e")"
   note="$(override_note)"
   echo "override:   ${note:-none}"
   if [[ -s "$HANDOFF" ]]; then
@@ -455,13 +512,13 @@ status_mode() {
 
 case "${1:-guard}" in
   guard | "")
-    m="$(minute_now)"
-    if is_open "$m"; then exit 0; fi
+    e="$(now_epoch)"
+    if ! is_peak "$e"; then exit 0; fi
     if override_active; then
-      echo "$(override_note)" >&2
+      override_note >&2
       exit 0
     fi
-    echo "$(peak_message)" >&2
+    peak_message >&2
     exit 1
     ;;
   --hook | hook)
@@ -483,7 +540,7 @@ case "${1:-guard}" in
     echo "override cleared; peak hours stop work again."
     ;;
   help | -h | --help)
-    sed -n '2,22p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "deepseek-window: unknown mode '$1' (try: status, watch, override, --hook)" >&2

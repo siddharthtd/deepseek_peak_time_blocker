@@ -4,17 +4,17 @@ Keeps AI work inside the DeepSeek off-peak window — for **every** VS Code
 workspace on the machine, not just one repo — with a manual override only the
 owner can arm.
 
-| | clock time |
+| | UTC |
 | --- | --- |
-| Off-peak — work allowed | **04:00-06:00** and **10:00-01:00** (the second window crosses midnight) |
-| Peak — work stopped | **01:00-04:00** and **06:00-10:00** |
-| Default | **no** — outside an allowed window, nothing runs |
+| Peak — work stopped | **Mon-Fri 01:00-04:00** and **06:00-10:00** |
+| Off-peak — work allowed | everything else, **including the whole weekend** |
+| Default | **no** — if it is a peak hour, nothing runs |
 
-Those are times on **this machine's own clock**, not UTC, so the rule reads the
-same way wherever the guard is installed: at 8 PM you are inside off-peak, at
-2 AM you are not. Every message prints the UTC equivalent of the boundary next to
-the local one, and `AI_WINDOW_TZ=UTC` (or any IANA zone, e.g.
-`America/Los_Angeles`) pins the windows to another clock entirely.
+The decision is made on the **UTC clock** — that is DeepSeek's own schedule — and
+the machine's timezone is only used to *show* you where a boundary lands in your
+own day. A refusal reads like `now it is 02:15 UTC (19:15 PDT). Work resumes at
+04:00 UTC (21:00 PDT), in 1h 45m.`, and `status` gives the current state, the
+next change, and the countdown (including Friday 10:00 UTC resuming on Monday).
 
 ## Install
 
@@ -56,7 +56,8 @@ The watcher needs launchd (macOS) or systemd (Linux); without either, run
 
 **Peak starts.** The `PreToolUse` hook refuses every agent tool call and returns
 `continue: false`, so the session stops instead of retrying, with a message that
-names the resume time. A prompt you submit during peak is *parked*, not lost.
+names the rule, the current UTC time, and when work resumes in both clocks. A
+prompt you submit during peak is *parked*, not lost.
 
 **Off-peak starts.** Tool calls pass again. Parked work is handed back to a
 running session once, as hook context, and the watcher wakes at the boundary,
@@ -91,17 +92,16 @@ want an override that no in-workspace process can even attempt, set
 ~/.copilot/hooks/deepseek-window.sh watch         # the boundary watcher (install.sh sets this up)
 ~/.copilot/hooks/deepseek-window.sh override      # owner-only, interactive
 ~/.copilot/hooks/deepseek-window.sh               # guard mode: exit 0 allowed, exit 1 denied
-AI_WINDOW_TEST_NOW=02:00 ~/.copilot/hooks/deepseek-window.sh status   # fake the clock
+AI_WINDOW_TEST_NOW=02:00 AI_WINDOW_TEST_DAY=Mon ~/.copilot/hooks/deepseek-window.sh status   # fake the clock
 ```
 
-Useful environment variables: `AI_WINDOW_TZ` (which clock the windows are on,
-`local` by default), `AI_WINDOW_OVERRIDE` / `AI_WINDOW_OVERRIDE_REASON`,
-`AI_WINDOW_CODE_BIN` (path to the VS Code CLI), `AI_WINDOW_STATE_DIR`,
-`AI_WINDOW_TEST_NOW`.
+Useful environment variables: `AI_WINDOW_OVERRIDE` / `AI_WINDOW_OVERRIDE_REASON`,
+`AI_WINDOW_CODE_BIN` (path to the VS Code CLI), `AI_WINDOW_STATE_DIR`, and the
+test clock `AI_WINDOW_TEST_NOW` (UTC `HH:MM`) with `AI_WINDOW_TEST_DAY`
+(`Mon`..`Sun`, or `1`..`7`).
 
-Changing the windows: edit the four `W1_OPEN` / `W1_CLOSE` / `W2_OPEN` /
-`W2_CLOSE` constants at the top of `deepseek-window.sh` (minutes of day on the
-window clock) and re-run `./install.sh`.
+Changing the windows: edit the four `PEAK*` minute constants and `PEAK_DAYS`
+(`1`=Mon .. `5`=Fri) at the top of `deepseek-window.sh` and re-run `./install.sh`.
 
 ## Uninstall
 
