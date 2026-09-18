@@ -2,7 +2,8 @@
 
 Keeps AI work inside the DeepSeek off-peak window — for **every** VS Code
 workspace on the machine, not just one repo — with a manual override only the
-owner can arm.
+owner can arm, and a one-word `extend` that holds a block open a few minutes
+longer.
 
 | | UTC |
 | --- | --- |
@@ -56,8 +57,9 @@ The watcher needs launchd (macOS) or systemd (Linux); without either, run
 
 **Peak starts.** The `PreToolUse` hook refuses every agent tool call and returns
 `continue: false`, so the session stops instead of retrying, with a message that
-names the rule, the current UTC time, and when work resumes in both clocks. A
-prompt you submit during peak is *parked*, not lost.
+names the rule, the current UTC time, and when work resumes in both clocks — and,
+if you have extended the block, how much longer it is running. A prompt you
+submit during peak is *parked*, not lost.
 
 **Off-peak starts.** Tool calls pass again. Parked work is handed back to a
 running session once, as hook context, and the watcher wakes at the boundary,
@@ -85,12 +87,44 @@ override stays something you do, not something an agent talks itself into. If yo
 want an override that no in-workspace process can even attempt, set
 `AI_WINDOW_OVERRIDE=1` in the environment VS Code itself was launched with.
 
+## Holding a block open longer (`extend`)
+
+```sh
+~/.copilot/hooks/deepseek-window.sh extend --minutes 5     # 1..9, default 5
+```
+
+While a block is firing, `extend` pushes the resume boundary out by N minutes
+(default 5, maximum 9). No phrase and no interactive terminal: one word is the
+whole interaction. Repeat calls add up — five calls of 5 minutes hold the block
+25 minutes past its scheduled end — but a single call can never add ten minutes
+or more.
+
+The asymmetry with `override` is deliberate. That mode lets work *through*, so
+it is owner-only and asks you to type a phrase; `extend` only ever stops work for
+longer, and while a block is firing an agent cannot run anything at all — so it
+needs no ceremony. Both modes are refused outside a block: off-peak there is
+nothing to extend or override.
+
+While an extension is live, everything that reads the window says so:
+
+```
+state:      PEAK (extended) — work stopped until 04:05 UTC (21:05 PDT), in 2m
+extend:     block extended by 5m past 04:00 UTC — work resumes 04:05 UTC (21:05 PDT)
+```
+
+and a refusal adds `The owner extended this block by 5m (it was scheduled to end
+04:00 UTC).` The watcher announces `PEAK HOURS (extended) — work stays stopped`
+when the scheduled boundary passes instead of calling off-peak. To drop an
+extension by hand, delete the state file (`rm ~/.deepseek-window/extend`); one
+that has run out is ignored and removed by itself.
+
 ## Commands
 
 ```sh
-~/.copilot/hooks/deepseek-window.sh status        # state, next boundary, override, parked work
+~/.copilot/hooks/deepseek-window.sh status        # state, next boundary, override, extension, parked work
 ~/.copilot/hooks/deepseek-window.sh watch         # the boundary watcher (install.sh sets this up)
 ~/.copilot/hooks/deepseek-window.sh override      # owner-only, interactive
+~/.copilot/hooks/deepseek-window.sh extend        # hold a running block open, under ten minutes a call
 ~/.copilot/hooks/deepseek-window.sh               # guard mode: exit 0 allowed, exit 1 denied
 AI_WINDOW_TEST_NOW=02:00 AI_WINDOW_TEST_DAY=Mon ~/.copilot/hooks/deepseek-window.sh status   # fake the clock
 ```
@@ -115,7 +149,7 @@ Changing the windows: edit the four `PEAK*` minute constants and `PEAK_DAYS`
 ```
 ~/.copilot/hooks/deepseek-window.sh     the guard (this repo's deepseek-window.sh)
 ~/.copilot/hooks/deepseek-window.json   the hook wiring (all four events)
-~/.deepseek-window/                     handoff, handoff.dir, override, watch.log
+~/.deepseek-window/                     handoff, handoff.dir, override, extend, watch.log
 ~/Library/LaunchAgents/<label>.plist     macOS watcher   (or ~/.config/systemd/user/<label>.service)
 <vscode user settings>.json             chat.hookFilesLocations gains ~/.copilot/hooks
 ```
@@ -138,7 +172,7 @@ Changing the windows: edit the four `PEAK*` minute constants and `PEAK_DAYS`
 ## Verify
 
 ```sh
-./verify.sh          # boundaries, hook contract, owner-only rules, watcher
+./verify.sh          # boundaries, hook contract, owner-only rules, extend, watcher
 ```
 
 In VS Code: `View Logs` → look for `Load Hooks` to confirm the hook file was

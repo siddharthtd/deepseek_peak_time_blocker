@@ -18,12 +18,18 @@
 #   deepseek-window.sh override [--minutes N] [--reason "..."]
 #                                     owner-only: interactive TTY + typed phrase
 #   deepseek-window.sh override:clear
+#   deepseek-window.sh extend [--minutes N]
+#                                     keep the block firing N minutes longer;
+#                                     N is under ten, and no phrase is needed
 #
 # State lives in ~/.deepseek-window/: `handoff` is the work parked by the last
-# peak window, `override` is the owner's temporary allow.
+# peak window, `override` is the owner's temporary allow, and `extend` is the
+# extra minutes the owner has added to the block that is firing.
 #
 # The owner is the only one who can arm the override — it needs a real terminal
-# and a typed phrase, and the hook refuses an agent's attempt to run it.
+# and a typed phrase, and the hook refuses an agent's attempt to run it. The
+# other direction needs neither: `extend` only ever stops work for longer, a
+# few minutes at a time, so it is one word with nothing to confirm.
 #
 # Verify without waiting for the clock (both values are UTC):
 #   AI_WINDOW_TEST_NOW=05:30 AI_WINDOW_TEST_DAY=Mon deepseek-window.sh status
@@ -33,6 +39,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 STATE_DIR="${AI_WINDOW_STATE_DIR:-$HOME/.deepseek-window}"
 HANDOFF="$STATE_DIR/handoff"
 OVERRIDE_FILE="$STATE_DIR/override"
+EXTEND_FILE="$STATE_DIR/extend"
 
 # Peak windows: minutes of day UTC, plus the UTC days they apply to (1=Mon..5=Fri,
 # 0=Sun, 6=Sat). Change these four numbers and $PEAK_DAYS to change the rule.
@@ -44,6 +51,15 @@ PEAK_DAYS="12345"
 
 PHRASE="override peak hours"
 MAX_MINUTES=240
+# `extend` keeps a block firing past its scheduled end. One call adds under ten
+# minutes on purpose: the windows are short, and a step-wise nudge is an
+# operator holding the door shut a little longer, not a second schedule.
+DEFAULT_EXTEND=5
+MAX_EXTEND=9
+# An extension is only ever armed while its block is firing, so its scheduled end
+# can be at most one window away. Anything further out is not an extension.
+MAX_EXTEND_AHEAD=$(( 6 * 3600 ))
+SCAN_MINUTES=$(( 10 * 24 * 60 )) # how far the effective-state scan looks ahead
 CODE_BIN_OVERRIDE="${AI_WINDOW_CODE_BIN:-}"
 OWNER_ONLY="owner-only: the DeepSeek off-peak override is the owner's call, not an agent's. Ask the owner to run '$SELF override' in their own terminal (it needs an interactive TTY and a typed phrase)."
 
@@ -130,9 +146,52 @@ is_peak() { # epoch
     (( minute >= PEAK2_OPEN && minute < PEAK2_CLOSE ))
 }
 
-# The next instant the state flips: a peak start while we are off-peak, or the
-# end of the window we are in. Weekends fall out of this for free.
-next_change() { # epoch -> epoch
+# The owner's extension, cached so the decision functions stay arithmetic-only.
+# `load_extend` re-reads it (the watcher calls it once per loop, so a live
+# session notices an `extend` the moment the owner types it). State that does
+# not describe the block that is firing — spent, misaimed, or from another
+# week — is dropped there rather than obeyed.
+EXT_UNTIL=0
+EXT_BASE=0
+EXT_MINUTES=0
+load_extend() {
+  local now alive=1
+  now="$(now_epoch)"
+  EXT_UNTIL="$(kv "$EXTEND_FILE" until_epoch)"
+  EXT_BASE="$(kv "$EXTEND_FILE" peak_end_epoch)"
+  EXT_MINUTES="$(kv "$EXTEND_FILE" extra_minutes)"
+  [[ "$EXT_UNTIL" =~ ^[0-9]+$ ]] || EXT_UNTIL=0
+  [[ "$EXT_BASE" =~ ^[0-9]+$ ]] || EXT_BASE=0
+  [[ "$EXT_MINUTES" =~ ^[0-9]+$ ]] || EXT_MINUTES=0
+  if (( EXT_UNTIL > 0 )); then
+    # Spent, pointing at an instant that is not a window end at all, or at a
+    # window that is not the one firing: none of those is an extension.
+    if (( EXT_UNTIL <= now )); then alive=0; fi
+    if is_peak "$EXT_BASE" || ! is_peak "$(( EXT_BASE - 60 ))"; then alive=0; fi
+    if (( EXT_BASE - now > MAX_EXTEND_AHEAD )); then alive=0; fi
+  fi
+  if (( alive == 0 )); then
+    # Read it once more before deleting, so a concurrent `extend` is not lost.
+    if [[ -f "$EXTEND_FILE" && "$(kv "$EXTEND_FILE" until_epoch)" == "$EXT_UNTIL" ]]; then
+      rm -f "$EXTEND_FILE"
+    fi
+    EXT_UNTIL=0
+    EXT_BASE=0
+    EXT_MINUTES=0
+  fi
+}
+
+# Is work stopped right now? The scheduled window, or the tail the owner added
+# to it. Every gate asks this, never is_peak, so an extension binds everywhere.
+blocked() { # epoch
+  if is_peak "$1"; then return 0; fi
+  if (( EXT_UNTIL > $1 )); then return 0; fi
+  return 1
+}
+
+# The next instant the *scheduled* state flips: a peak start while we are
+# off-peak, or the end of the window we are in. Weekends fall out for free.
+sched_next_change() { # epoch -> epoch
   local e="$1" base day k cand cur nxt
   base=$(( e - e % 86400 ))
   if is_peak "$e"; then cur=1; else cur=0; fi
@@ -147,6 +206,28 @@ next_change() { # epoch -> epoch
         fi
       fi
     done
+  done
+  printf '%s' "$(( e + 86400 ))" # unreachable with these windows
+}
+
+# The instant the state flips for real, extension included: an extension ends a
+# block late, and can even carry it into the next window, so this walks the
+# clock a minute at a time (a boundary is always on a minute). With no
+# extension armed it is the plain schedule again, at no cost.
+next_change() { # epoch -> epoch
+  local e="$1" cur nxt m i
+  if (( EXT_UNTIL == 0 )); then
+    sched_next_change "$e"
+    return 0
+  fi
+  if blocked "$e"; then cur=1; else cur=0; fi
+  m=$(( e - e % 60 + 60 ))
+  for (( i = 0; i < SCAN_MINUTES; i++, m += 60 )); do
+    if blocked "$m"; then nxt=1; else nxt=0; fi
+    if (( nxt != cur )); then
+      printf '%s' "$m"
+      return 0
+    fi
   done
   printf '%s' "$(( e + 86400 ))" # unreachable with these windows
 }
@@ -197,11 +278,13 @@ at_both() { # epoch
 }
 
 state_line() { # epoch
-  local e="$1" change secs dow
+  local e="$1" change secs dow label
   change="$(next_change "$e")"
   secs=$(( change - e ))
-  if is_peak "$e"; then
-    printf 'PEAK — work stopped until %s, in %s' "$(at_both "$change")" "$(human "$secs")"
+  if blocked "$e"; then
+    label=PEAK
+    if (( EXT_UNTIL > e )) && ! is_peak "$e"; then label='PEAK (extended)'; fi
+    printf '%s — work stopped until %s, in %s' "$label" "$(at_both "$change")" "$(human "$secs")"
     return 0
   fi
   dow="$(epoch_dow "$e")"
@@ -214,12 +297,16 @@ state_line() { # epoch
 }
 
 peak_message() { # the whole sentence a blocked agent and its owner see
-  local e change secs
+  local e change secs ext
   e="$(now_epoch)"
   change="$(next_change "$e")"
   secs=$(( change - e ))
-  printf 'Peak hours: work is stopped. The rule is Mon-Fri 01:00-04:00 and 06:00-10:00 UTC; now it is %s. Work resumes at %s, in %s. Owner override: %s override (interactive, owner-only)%s.' \
-    "$(at_both "$e")" "$(at_both "$change")" "$(human "$secs")" "$SELF" "$CLOCK_NOTE"
+  ext=""
+  if (( EXT_UNTIL > 0 )); then
+    ext=" The owner extended this block by ${EXT_MINUTES}m (it was scheduled to end $(utc_hm "$EXT_BASE") UTC)."
+  fi
+  printf 'Peak hours: work is stopped. The rule is Mon-Fri 01:00-04:00 and 06:00-10:00 UTC; now it is %s. Work resumes at %s, in %s.%s Owner override: %s override (interactive, owner-only)%s.' \
+    "$(at_both "$e")" "$(at_both "$change")" "$(human "$secs")" "$ext" "$SELF" "$CLOCK_NOTE"
 }
 
 # ---------------------------------------------------------------------------
@@ -229,6 +316,14 @@ peak_message() { # the whole sentence a blocked agent and its owner see
 kv() { # file, key
   [[ -f "$1" ]] || return 0
   sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
+# "user@tty", without the stray line `tty` prints when there is no terminal.
+who() {
+  local t=""
+  if [[ -t 0 ]]; then t="$(tty 2>/dev/null || true)"; fi
+  [[ -n "$t" ]] || t="not a tty"
+  printf '%s@%s' "${USER:-$(id -un)}" "$t"
 }
 
 handoff_save() { # text, workspace dir
@@ -312,6 +407,8 @@ hook_mode() {
   [[ -n "$event" ]] || event="PreToolUse"
 
   # Owner-only: an agent may not arm the override, and the client enforces it.
+  # `extend` is deliberately absent from this list: it only ever stops work for
+  # longer, and an agent cannot run anything at all while a block is firing.
   case "$tool" in
     run_in_terminal | send_to_terminal)
       if printf '%s' "$payload" | grep -Eq 'deepseek-window\.sh.*override|AI_WINDOW_OVERRIDE='; then
@@ -323,7 +420,7 @@ hook_mode() {
 
   e="$(now_epoch)"
 
-  if ! is_peak "$e"; then
+  if ! blocked "$e"; then
     # Work may proceed. Hand back anything the last peak window parked, once.
     handoff=""
     case "$event" in
@@ -423,16 +520,27 @@ watch_mode() {
   cd "$dir" 2>/dev/null || true
   echo "deepseek-window: watching $PWD — peak Mon-Fri 01:00-04:00 and 06:00-10:00 UTC, off-peak otherwise."
   while :; do
+    load_extend
     e="$(now_epoch)"
-    if is_peak "$e"; then state=peak; else state=open; fi
+    if blocked "$e"; then
+      if (( EXT_UNTIL > e )) && ! is_peak "$e"; then state=extended; else state=peak; fi
+    else
+      state=open
+    fi
     if [[ "$state" != "$prev" ]]; then
       change="$(next_change "$e")"
-      if [[ "$state" == "open" ]]; then
-        echo "OFF-PEAK — work resumes now ($(at_both "$e")). Next peak: $(at_both "$change")."
-        restart_handoff
-      else
-        echo "PEAK HOURS — work stops now ($(at_both "$e")). Work resumes $(at_both "$change")."
-      fi
+      case "$state" in
+        open)
+          echo "OFF-PEAK — work resumes now ($(at_both "$e")). Next peak: $(at_both "$change")."
+          restart_handoff
+          ;;
+        extended)
+          echo "PEAK HOURS (extended) — work stays stopped, ${EXT_MINUTES}m past the scheduled end. Work resumes $(at_both "$change")."
+          ;;
+        *)
+          echo "PEAK HOURS — work stops now ($(at_both "$e")). Work resumes $(at_both "$change")."
+          ;;
+      esac
       prev="$state"
     fi
     change="$(next_change "$e")"
@@ -461,7 +569,7 @@ override_arm() {
     exit 64
   fi
   e="$(now_epoch)"
-  if ! is_peak "$e"; then
+  if ! blocked "$e"; then
     echo "override: work is already allowed ($(at_both "$e")); nothing to override."
     exit 0
   fi
@@ -480,12 +588,76 @@ override_arm() {
   umask 077
   {
     printf 'armed_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'armed_by=%s\n' "${USER:-$(id -un)}@$(tty 2>/dev/null || echo '?')"
+    printf 'armed_by=%s\n' "$(who)"
     printf 'minutes=%s\n' "$minutes"
     printf 'expires_epoch=%s\n' "$target"
     printf 'reason=%s\n' "${reason:-not given}"
   } > "$OVERRIDE_FILE"
   echo "override armed until $(at_both "$target"), for ${minutes}m. Every decision says so until then, and it expires by itself."
+}
+
+# ---------------------------------------------------------------------------
+# extend: hold the door shut a little longer (no phrase, still the owner's)
+# ---------------------------------------------------------------------------
+
+extend_note() { # one line for status
+  if (( EXT_UNTIL == 0 )); then
+    echo none
+    return 0
+  fi
+  printf 'block extended by %sm past %s UTC — work resumes %s' \
+    "$EXT_MINUTES" "$(utc_hm "$EXT_BASE")" "$(at_both "$EXT_UNTIL")"
+}
+
+extend_arm() {
+  local minutes="$DEFAULT_EXTEND" e base extra until count tmp
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --minutes) minutes="${2:-}"; shift 2 ;;
+      *) echo "extend: unknown argument '$1'" >&2; exit 64 ;;
+    esac
+  done
+  if [[ ! "$minutes" =~ ^[0-9]+$ ]] || (( minutes < 1 || minutes > MAX_EXTEND )); then
+    echo "extend: --minutes must be 1..$MAX_EXTEND — one call adds under ten minutes on purpose" >&2
+    exit 64
+  fi
+  e="$(now_epoch)"
+  if ! blocked "$e"; then
+    echo "extend: nothing is blocked right now ($(at_both "$e")), so there is nothing to extend."
+    echo "        The next block starts $(at_both "$(sched_next_change "$e")"); run 'extend' while it is firing."
+    exit 0
+  fi
+  if (( EXT_UNTIL > e )); then
+    # Already extending this block: push its end out, never back.
+    base="$EXT_BASE"
+    extra="$EXT_MINUTES"
+    until="$EXT_UNTIL"
+  else
+    until="$(sched_next_change "$e")"
+    base="$until"
+    extra=0
+  fi
+  count="$(kv "$EXTEND_FILE" count)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  extra=$(( extra + minutes ))
+  until=$(( until + minutes * 60 ))
+  mkdir -p "$STATE_DIR"
+  umask 077
+  tmp="$EXTEND_FILE.tmp"
+  {
+    printf 'peak_end_epoch=%s\n' "$base"
+    printf 'extra_minutes=%s\n' "$extra"
+    printf 'until_epoch=%s\n' "$until"
+    printf 'count=%s\n' "$(( count + 1 ))"
+    printf 'armed_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'armed_by=%s\n' "$(who)"
+  } > "$tmp"
+  mv -f "$tmp" "$EXTEND_FILE" # atomic, so a reader never sees half of it
+  EXT_UNTIL="$until"
+  EXT_BASE="$base"
+  EXT_MINUTES="$extra"
+  echo "extended: the block now ends $(at_both "$until") — ${minutes}m more, ${extra}m past the scheduled end."
+  echo "          under ten minutes a call by design; 'override' still lifts the block if you need to work."
 }
 
 # ---------------------------------------------------------------------------
@@ -501,6 +673,7 @@ status_mode() {
   echo "state:      $(state_line "$e")"
   note="$(override_note)"
   echo "override:   ${note:-none}"
+  echo "extend:     $(extend_note)"
   if [[ -s "$HANDOFF" ]]; then
     echo "parked:     $(cat "$HANDOFF")"
   elif [[ -f "$STATE_DIR/handoff.done" ]]; then
@@ -510,10 +683,13 @@ status_mode() {
   fi
 }
 
+# Read the owner's extension once, so every decision below sees it.
+load_extend
+
 case "${1:-guard}" in
   guard | "")
     e="$(now_epoch)"
-    if ! is_peak "$e"; then exit 0; fi
+    if ! blocked "$e"; then exit 0; fi
     if override_active; then
       override_note >&2
       exit 0
@@ -535,15 +711,19 @@ case "${1:-guard}" in
     shift
     override_arm "$@"
     ;;
+  extend)
+    shift
+    extend_arm "$@"
+    ;;
   override:clear)
     rm -f "$OVERRIDE_FILE"
     echo "override cleared; peak hours stop work again."
     ;;
   help | -h | --help)
-    sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '2,35p' "$SELF" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    echo "deepseek-window: unknown mode '$1' (try: status, watch, override, --hook)" >&2
+    echo "deepseek-window: unknown mode '$1' (try: status, watch, override, extend, --hook)" >&2
     exit 64
     ;;
 esac
